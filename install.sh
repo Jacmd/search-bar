@@ -19,13 +19,13 @@ echo ""
 
 # ── 1. System packages ────────────────────────────────────────────────────────
 info "Installing system packages…"
+sudo apt-get update -qq
 sudo apt-get install -y \
     python3-gi \
     python3-gi-cairo \
     gir1.2-gtk-3.0 \
     plocate \
-    xdg-utils \
-    >/dev/null 2>&1
+    xdg-utils
 ok "Packages installed"
 
 # Update locate database (background, non-fatal)
@@ -61,41 +61,43 @@ ok ".desktop entry created"
 # ── 4. Keyboard shortcut via gsettings ───────────────────────────────────────
 info "Registering keyboard shortcut ($SHORTCUT_KEY)…"
 
-BINDING_CMD="python3 $APP_PY --toggle"
+BINDING_CMD="python3 \"$APP_PY\" --toggle"
 BINDING_NAME="Search Bar"
 
-# Find a free custom slot
-SLOT=0
-while gsettings get \
-    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:\
-/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom${SLOT}/" \
-    name &>/dev/null 2>&1; do
-    SLOT=$((SLOT + 1))
-done
-
-BPATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom${SLOT}/"
-
-gsettings set \
-    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${BPATH}" \
-    name    "$BINDING_NAME"
-gsettings set \
-    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${BPATH}" \
-    command "$BINDING_CMD"
-gsettings set \
-    "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding:${BPATH}" \
-    binding "$SHORTCUT_KEY"
-
-# Append to the custom-keybindings list
-CURRENT=$(gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings)
-if [[ "$CURRENT" == "@as []" || "$CURRENT" == "[]" ]]; then
-    NEW_LIST="['${BPATH}']"
+# Pop!_OS 24.04 ships COSMIC, which doesn't use GNOME's gsettings shortcuts.
+DESKTOP="${XDG_CURRENT_DESKTOP:-}"
+if [[ "$DESKTOP" == *COSMIC* ]] || ! command -v gsettings >/dev/null 2>&1; then
+    err "Detected '${DESKTOP:-unknown}' desktop — automatic shortcut setup supports GNOME only."
+    info "Add it manually: Settings → Keyboard → Custom Shortcuts"
+    info "    Command:  $BINDING_CMD"
+    info "    Shortcut: $SHORTCUT_KEY"
 else
-    # Insert before the closing ]
-    NEW_LIST="${CURRENT%]}, '${BPATH}']"
-fi
-gsettings set org.gnome.settings-daemon.plugins.media-keys custom-keybindings "$NEW_LIST"
+    # Find a free custom slot
+    SLOT=0
+    GKEY="org.gnome.settings-daemon.plugins.media-keys"
+    while gsettings get \
+        "${GKEY}.custom-keybinding:/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom${SLOT}/" \
+        name &>/dev/null 2>&1; do
+        SLOT=$((SLOT + 1))
+    done
 
-ok "Keyboard shortcut registered: $SHORTCUT_KEY"
+    BPATH="/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/custom${SLOT}/"
+
+    gsettings set "${GKEY}.custom-keybinding:${BPATH}" name    "$BINDING_NAME"
+    gsettings set "${GKEY}.custom-keybinding:${BPATH}" command "$BINDING_CMD"
+    gsettings set "${GKEY}.custom-keybinding:${BPATH}" binding "$SHORTCUT_KEY"
+
+    # Append to the custom-keybindings list
+    CURRENT=$(gsettings get "$GKEY" custom-keybindings)
+    if [[ "$CURRENT" == "@as []" || "$CURRENT" == "[]" ]]; then
+        NEW_LIST="['${BPATH}']"
+    else
+        NEW_LIST="${CURRENT%]}, '${BPATH}']"
+    fi
+    gsettings set "$GKEY" custom-keybindings "$NEW_LIST"
+
+    ok "Keyboard shortcut registered: $SHORTCUT_KEY"
+fi
 
 # ── 5. Autostart (optional) ───────────────────────────────────────────────────
 AUTOSTART_DIR="$HOME/.config/autostart"
@@ -104,7 +106,7 @@ cat > "$AUTOSTART_DIR/search-bar.desktop" << EOF
 [Desktop Entry]
 Name=Search Bar Daemon
 Comment=Start the search bar daemon at login
-Exec=python3 $APP_PY
+Exec=python3 "$APP_PY" --daemon
 Type=Application
 Hidden=false
 NoDisplay=true
