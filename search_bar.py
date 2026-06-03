@@ -21,7 +21,15 @@ gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
 from gi.repository import Gtk, Gdk, GLib, Pango
 
-SOCKET_PATH = '/tmp/.search_bar_daemon.sock'
+def _socket_path() -> str:
+    """Per-user, private (0700) runtime dir — not world-accessible like /tmp."""
+    runtime = os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}'
+    if not os.path.isdir(runtime):
+        runtime = os.path.expanduser('~/.cache')
+    return os.path.join(runtime, 'search_bar_daemon.sock')
+
+
+SOCKET_PATH = _socket_path()
 WINDOW_WIDTH = 700
 
 SEARCH_ENGINES = [
@@ -266,7 +274,6 @@ class SearchApp:
         self._cancel = False
         self.results: list = []
         self.selected: int = -1
-        self._focus_guard = False  # prevents immediate close on launch
 
         self._setup_ipc()
         self._build_window()
@@ -286,8 +293,11 @@ class SearchApp:
 
     def _on_ipc(self, fd, condition):
         conn, _ = self._server.accept()
+        conn.settimeout(0.5)  # never let a stalled client block the GTK main loop
         try:
             data = conn.recv(64)
+        except OSError:
+            return True
         finally:
             conn.close()
         if data == b'toggle':
@@ -433,14 +443,12 @@ class SearchApp:
         self.entry.set_text('')
         self._clear_results()
         self._position()
-        self._focus_guard = True
         self.win.show_all()
         self._divider.hide()
         self._scroll.hide()
         self._clear_btn.hide()
         self.win.present()
         self.entry.grab_focus()
-        GLib.timeout_add(3000, self._release_focus_guard)
 
     # ── Event handlers ────────────────────────────────────────────────────────
 
@@ -461,16 +469,6 @@ class SearchApp:
             else:
                 self._on_enter(None)
             return True
-        return False
-
-    def _release_focus_guard(self):
-        self._focus_guard = False
-        return False
-
-    def _on_focus_out(self, _win, _event):
-        if self._focus_guard:
-            return False
-        GLib.timeout_add(180, lambda: self.win.hide() or False)
         return False
 
     def _on_clear(self, _btn):
@@ -714,34 +712,45 @@ class SearchApp:
 
     # ── Run ───────────────────────────────────────────────────────────────────
 
-    def run(self):
+    def run(self, show: bool = True):
         signal.signal(signal.SIGINT,  lambda *_: Gtk.main_quit())
         signal.signal(signal.SIGTERM, lambda *_: Gtk.main_quit())
-        self._show()
-        Gtk.main()
+        if show:
+            self._show()
+        try:
+            Gtk.main()
+        finally:
+            # Tidy up the IPC socket so a restart never trips on a stale file.
+            try:
+                self._server.close()
+                os.unlink(SOCKET_PATH)
+            except OSError:
+                pass
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
     args = sys.argv[1:]
+    known = {'--toggle', '--show', '--daemon', '--no-fork'}
+    unknown = [a for a in args if a not in known]
+    if unknown:
+        print(f"Usage: {sys.argv[0]} [--toggle | --show | --daemon]")
+        sys.exit(1)
 
     if '--toggle' in args:
-        # Signal existing instance to toggle, or fall through to start fresh
+        # Signal an existing daemon to toggle; if none, fall through to start one.
         if send_command(b'toggle'):
             sys.exit(0)
     elif '--show' in args:
         if send_command(b'show'):
             sys.exit(0)
-    elif args and '--no-fork' not in args:
-        print(f"Usage: {sys.argv[0]} [--toggle | --show]")
-        sys.exit(1)
-    elif '--no-fork' not in args:
-        # No args: if already running, just show it
+    elif '--daemon' not in args:
+        # No flag: if a daemon is already running, just show it.
         if send_command(b'show'):
             sys.exit(0)
 
-    # Re-launch with --no-fork so the background process has no threads yet
+    # Re-launch detached so the GTK process starts with no inherited threads.
     if '--no-fork' not in args:
         subprocess.Popen(
             [sys.executable] + sys.argv + ['--no-fork'],
@@ -750,8 +759,9 @@ def main():
         )
         sys.exit(0)
 
+    # --daemon starts hidden (for autostart); otherwise show the bar immediately.
     app = SearchApp()
-    app.run()
+    app.run(show='--daemon' not in args)
 
 
 if __name__ == '__main__':
